@@ -1,82 +1,85 @@
 import pika
-import psycopg2
-import json
 import time
+import json
+import psycopg2
 
-# 1. DB CONFIG (Must match your C++ settings)
+# ⚡ DATABASE CONFIG (Matches your C++ Config)
 DB_CONFIG = {
     "dbname": "ticketmaster",
     "user": "postgres",
     "password": "password123",
-    "host": "localhost",
-    "port": "5432"
+    "host": "localhost"
 }
 
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# 2. THE WORKER LOGIC
-def callback(ch, method, properties, body):
-    msg = body.decode()
-    print(f"📥 RECEIVED: {msg}")
+def process_booking(ch, method, properties, body):
+    print(f"📥 [Worker] Received: {body.decode()}")
     
-    # Message Format: "BOOK {seat_id} {user_id}"
-    parts = msg.split(" ")
-    if len(parts) < 3:
+    data = body.decode().split() # Format: "BOOK <seat_id> <user_id>"
+    if len(data) < 3:
         print("❌ Invalid Message Format")
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        # 💀 DEAD LETTER LOGIC: 
+        # We 'nack' (negative ack) it so it doesn't stay in the queue forever
+        # false = don't requeue (send to dead letter graveyard)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
         return
 
-    seat_id = int(parts[1])
-    user_id = int(parts[2])
-
+    action, seat_id, user_id = data[0], data[1], data[2]
+    
     try:
+        # 🕒 SIMULATE WORK (e.g., Calling Bank API)
+        time.sleep(2) 
+        
         conn = get_db_connection()
         cur = conn.cursor()
-
-        # A. SIMULATE PROCESSING TIME (e.g., Bank transaction)
-        print("   💳 Contacting Bank API...", end="", flush=True)
-        time.sleep(2) # Simulate 2s delay
-        print(" PAID!")
-
-        # B. DB TRANSACTION: Create Booking & Link Seat
-        # 1. Insert Booking
+        
+        # 1. Create Booking in Postgres
         cur.execute(
-            "INSERT INTO bookings (user_id, show_id, status, total_amount) VALUES (%s, %s, 'CONFIRMED', 50.00) RETURNING id",
-            (user_id, 1) # Hardcoded Show ID 1 for now
+            "INSERT INTO bookings (user_id, show_id, status, total_amount) VALUES (%s, 1, 'CONFIRMED', 50.0) RETURNING id",
+            (user_id,)
         )
         booking_id = cur.fetchone()[0]
-
-        # 2. Link Seat (Map plain Seat ID to Screen Seat ID)
-        # In our simplified schema, we assume Seat ID matches Screen Seat ID directly
+        
+        # 2. Link Seat
         cur.execute(
             "INSERT INTO booking_seats (booking_id, screen_seat_id) VALUES (%s, %s)",
             (booking_id, seat_id)
         )
         
-        # 3. Update Seat Status in 'seats' table (Legacy table support)
-        cur.execute("UPDATE seats SET status = 'BOOKED' WHERE id = %s", (seat_id,))
-
         conn.commit()
         cur.close()
         conn.close()
         
-        print(f"   ✅ TICKET GENERATED! Booking ID: {booking_id}")
-        
-        # Acknowledge message (Tell RabbitMQ it's safe to delete)
+        print(f"✅ [Worker] TICKET GENERATED: Booking #{booking_id} for Seat {seat_id}")
+
+        # 🛡️ THE SAFETY NET: MANUAL ACKNOWLEDGMENT
+        # We only tell RabbitMQ to delete the message HERE, after DB is saved.
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     except Exception as e:
-        print(f"   ❌ DB ERROR: {e}")
-        # Negative Ack (Tell RabbitMQ to retry later)
+        print(f"🔥 [Worker] CRITICAL FAILURE: {e}")
+        # 🔄 RETRY LOGIC:
+        # If DB failed, we 'nack' with requeue=True so another worker can try.
+        # In a real system, you'd check retry counts to avoid infinite loops.
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-# 3. SETUP RABBITMQ LISTENER
-print("👷 WORKER SERVICE STARTED. Waiting for tickets...")
-connection = pika.BlockingConnection(pika.ConnectionParameters('127.0.0.1'))
-channel = connection.channel()
-channel.queue_declare(queue='bookings', durable=True)
+def start_worker():
+    print("👷 RabbitMQ Worker Started (With Manual Acks)...")
+    connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+    channel = connection.channel()
 
-channel.basic_qos(prefetch_count=1) # Handle 1 ticket at a time
-channel.basic_consume(queue='bookings', on_message_callback=callback)
-channel.start_consuming()
+    # Make sure queue exists and is durable
+    channel.queue_declare(queue='bookings', durable=True)
+
+    # Fair Dispatch: Don't give me more than 1 message at a time
+    channel.basic_qos(prefetch_count=1)
+
+    # 🛑 auto_ack=False is the key! We must ack manually.
+    channel.basic_consume(queue='bookings', on_message_callback=process_booking, auto_ack=False)
+
+    channel.start_consuming()
+
+if __name__ == "__main__":
+    start_worker()
