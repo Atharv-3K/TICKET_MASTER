@@ -6,30 +6,43 @@
 #include <condition_variable>
 #include <iostream>
 
-// 🏭 THE CONNECTION POOL
-// Keeps N connections open and recycles them.
+// 🚦 TRAFFIC CONTROL: TWO POOLS
+enum class PoolType {
+    MASTER, // Writes (INSERT, UPDATE)
+    REPLICA // Reads (SELECT)
+};
+
 class DBPool {
 private:
-    std::queue<std::shared_ptr<pqxx::connection>> pool_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    const int POOL_SIZE = 10;
+    std::queue<std::shared_ptr<pqxx::connection>> master_pool_;
+    std::queue<std::shared_ptr<pqxx::connection>> replica_pool_;
+    
+    std::mutex master_mutex_;
+    std::mutex replica_mutex_;
+    
+    std::condition_variable master_cv_;
+    std::condition_variable replica_cv_;
+
+    const int MASTER_SIZE = 2;   // Expensive, keep small
+    const int REPLICA_SIZE = 10; // Cheap, keep large
+    
     const std::string conn_str = "postgresql://postgres:password123@localhost:5432/ticketmaster";
 
-    // Singleton Stuff
     static DBPool* instance;
-    DBPool() {
-        for (int i = 0; i < POOL_SIZE; ++i) {
+
+    void fillPool(std::queue<std::shared_ptr<pqxx::connection>>& pool, int size) {
+        for (int i = 0; i < size; ++i) {
             try {
                 auto conn = std::make_shared<pqxx::connection>(conn_str);
-                if (conn->is_open()) {
-                    pool_.push(conn);
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "❌ Pool Init Error: " << e.what() << std::endl;
-            }
+                if (conn->is_open()) pool.push(conn);
+            } catch (...) {}
         }
-        std::cout << "💧 DB Pool Initialized with " << pool_.size() << " connections." << std::endl;
+    }
+
+    DBPool() {
+        fillPool(master_pool_, MASTER_SIZE);
+        fillPool(replica_pool_, REPLICA_SIZE);
+        std::cout << "⚖️ CQRS INITIALIZED: " << master_pool_.size() << " Master | " << replica_pool_.size() << " Replica Conns.\n";
     }
 
 public:
@@ -38,38 +51,58 @@ public:
         return instance;
     }
 
-    // Borrow a connection
-    std::shared_ptr<pqxx::connection> acquire() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        // Wait until a connection is available
-        cv_.wait(lock, [this] { return !pool_.empty(); });
-
-        auto conn = pool_.front();
-        pool_.pop();
-        return conn;
+    std::shared_ptr<pqxx::connection> acquire(PoolType type) {
+        if (type == PoolType::MASTER) {
+            std::unique_lock<std::mutex> lock(master_mutex_);
+            
+            // 🔍 TRACE LOG: PROOF OF WRITING
+            std::cout << "🔴 [CQRS] Borrowing from MASTER POOL (Writes). Available: " << master_pool_.size() << std::endl;
+            
+            master_cv_.wait(lock, [this] { return !master_pool_.empty(); });
+            auto conn = master_pool_.front();
+            master_pool_.pop();
+            return conn;
+        } else {
+            std::unique_lock<std::mutex> lock(replica_mutex_);
+            
+            // 🔍 TRACE LOG: PROOF OF READING
+            std::cout << "🟢 [CQRS] Borrowing from REPLICA POOL (Reads). Available: " << replica_pool_.size() << std::endl;
+            
+            replica_cv_.wait(lock, [this] { return !replica_pool_.empty(); });
+            auto conn = replica_pool_.front();
+            replica_pool_.pop();
+            return conn;
+        }
     }
 
-    // Return it
-    void release(std::shared_ptr<pqxx::connection> conn) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        pool_.push(conn);
-        lock.unlock();
-        cv_.notify_one();
+    void release(std::shared_ptr<pqxx::connection> conn, PoolType type) {
+        if (type == PoolType::MASTER) {
+            std::unique_lock<std::mutex> lock(master_mutex_);
+            master_pool_.push(conn);
+            lock.unlock();
+            master_cv_.notify_one();
+        } else {
+            std::unique_lock<std::mutex> lock(replica_mutex_);
+            replica_pool_.push(conn);
+            lock.unlock();
+            replica_cv_.notify_one();
+        }
     }
 };
 
 DBPool* DBPool::instance = nullptr;
 
-// 🪄 RAII WRAPPER
-// Automatically releases connection when it goes out of scope.
+// 🪄 SMART CONNECTION WRAPPER
 class DBConnection {
     std::shared_ptr<pqxx::connection> conn_;
+    PoolType type_;
 public:
-    DBConnection() {
-        conn_ = DBPool::GetInstance()->acquire();
+    // Default to REPLICA (Read) for safety
+    DBConnection(PoolType type = PoolType::REPLICA) : type_(type) {
+        conn_ = DBPool::GetInstance()->acquire(type);
     }
     ~DBConnection() {
-        DBPool::GetInstance()->release(conn_);
+        DBPool::GetInstance()->release(conn_, type_);
     }
     pqxx::connection& operator*() { return *conn_; }
     pqxx::connection* operator->() { return conn_.get(); }

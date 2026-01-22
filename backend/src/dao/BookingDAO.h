@@ -6,13 +6,16 @@
 
 class BookingDAO {
 public:
-    // 1. CREATE BOOKING (The Complex Transaction)
+    // =========================================================
+    // 1. CREATE BOOKING (WRITE -> MASTER POOL)
+    // =========================================================
     // Takes a user, a show, and a LIST of seat IDs.
     // Returns the new Booking ID.
     static int createBooking(int user_id, int show_id, const std::vector<int>& seat_ids, double amount) {
         try {
-            DBConnection conn;
-            pqxx::work txn(*conn); // Start Transaction
+            // 🔴 USE MASTER (Because we are INSERTING data)
+            DBConnection conn(PoolType::MASTER);
+            pqxx::work txn(*conn); 
 
             // A. Insert the main Booking Record
             pqxx::result res = txn.exec_params(
@@ -21,9 +24,7 @@ public:
             );
             int booking_id = res[0][0].as<int>();
 
-            // B. Link the Seats (Bulk Insert or Loop)
-            // In a real high-perf app, we'd build a single bulk query string.
-            // For clarity here, we loop (still fast inside a transaction).
+            // B. Link the Seats
             for (int seat_id : seat_ids) {
                 txn.exec_params(
                     "INSERT INTO booking_seats (booking_id, screen_seat_id) VALUES ($1, $2)",
@@ -40,11 +41,14 @@ public:
         }
     }
 
-    // 2. GET USER HISTORY
+    // =========================================================
+    // 2. GET USER HISTORY (READ -> REPLICA POOL)
+    // =========================================================
     static std::vector<Booking> getBookingsByUser(int user_id) {
         std::vector<Booking> list;
         try {
-            DBConnection conn;
+            // 🟢 USE REPLICA (Because we are only SELECTING)
+            DBConnection conn(PoolType::REPLICA);
             pqxx::work txn(*conn);
             
             pqxx::result res = txn.exec_params(

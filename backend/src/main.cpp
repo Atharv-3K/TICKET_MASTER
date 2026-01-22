@@ -47,7 +47,7 @@ int main(int argc, char* argv[])
     auto* redis = RedisManager::GetInstance();
     setupRabbitMQ();
 
-    std::cout << "\n🚀 TICKETMASTER BACKEND: READY (All Systems Go)\n";
+    std::cout << "\n🚀 TICKETMASTER BACKEND: READY (CQRS + RateLimit + RabbitMQ)\n";
 
     // ---------------------------------------------------------
     // 🚦 GLOBAL OPTIONS HANDLER
@@ -59,13 +59,15 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 1. SIGNUP
+    // 1. SIGNUP (WRITE -> MASTER POOL)
     // =========================================================
     CROW_ROUTE(app, "/api/signup").methods(crow::HTTPMethod::POST)([](const crow::request& req){
         auto x = crow::json::load(req.body);
         if (!x) return crow::response(400, "Invalid JSON");
         try {
-            DBConnection conn; pqxx::work txn(*conn);
+            // 🔴 WRITE ACTION
+            DBConnection conn(PoolType::MASTER); 
+            pqxx::work txn(*conn);
             txn.exec_params("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)", 
                 std::string(x["username"].s()), std::string(x["email"].s()), std::string(x["password"].s()));
             txn.commit();
@@ -75,13 +77,15 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 2. LOGIN
+    // 2. LOGIN (READ -> REPLICA POOL)
     // =========================================================
     CROW_ROUTE(app, "/api/login").methods(crow::HTTPMethod::POST)([](const crow::request& req){
         auto x = crow::json::load(req.body);
         if(!x) return crow::response(400, "Bad Request");
         try {
-            DBConnection conn; pqxx::work txn(*conn);
+            // 🟢 READ ACTION
+            DBConnection conn(PoolType::REPLICA); 
+            pqxx::work txn(*conn);
             pqxx::result res_db = txn.exec_params("SELECT password_hash FROM users WHERE email = $1", std::string(x["email"].s()));
             if (!res_db.empty() && std::string(x["password"].s()) == res_db[0][0].c_str()) {
                 std::string token = generateToken();
@@ -95,7 +99,7 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 3. PROFILE (RESTORED!)
+    // 3. PROFILE (READ -> REPLICA POOL)
     // =========================================================
     CROW_ROUTE(app, "/api/profile").methods(crow::HTTPMethod::GET)([redis](const crow::request& req){
         std::string token = req.get_header_value("Authorization");
@@ -109,11 +113,13 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 4. GET SEATS (REAL DATA)
+    // 4. GET SEATS (READ -> REPLICA POOL)
     // =========================================================
     CROW_ROUTE(app, "/api/seats").methods(crow::HTTPMethod::GET)([](const crow::request& req){
         try {
-            DBConnection conn; pqxx::work txn(*conn);
+            // 🟢 READ ACTION
+            DBConnection conn(PoolType::REPLICA); 
+            pqxx::work txn(*conn);
             std::string query = "SELECT s.id, CONCAT(s.row_code, s.seat_number), CASE WHEN b.status = 'CONFIRMED' THEN 'BOOKED' ELSE 'AVAILABLE' END FROM screen_seats s LEFT JOIN booking_seats bs ON s.id = bs.screen_seat_id LEFT JOIN bookings b ON bs.booking_id = b.id WHERE s.screen_id = 1 ORDER BY s.id ASC;";
             pqxx::result res_db = txn.exec(query);
             std::stringstream json;
@@ -130,7 +136,7 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 5. CATALOG CACHE
+    // 5. CATALOG CACHE (NO DB CHANGE - HANDLED BY DAO)
     // =========================================================
     CROW_ROUTE(app, "/api/theaters/<int>/shows").methods(crow::HTTPMethod::GET)
     ([redis](int theater_id){
@@ -142,7 +148,7 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 6. ATOMIC RESERVE
+    // 6. ATOMIC RESERVE (REDIS ONLY)
     // =========================================================
     CROW_ROUTE(app, "/api/reserve").methods(crow::HTTPMethod::POST)
     ([redis](const crow::request& req){
@@ -159,7 +165,7 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 7. PAY
+    // 7. PAY (RABBITMQ + FALLBACK DAO)
     // =========================================================
     CROW_ROUTE(app, "/api/pay").methods(crow::HTTPMethod::POST)
     ([redis](const crow::request& req){
@@ -179,6 +185,7 @@ int main(int argc, char* argv[])
             rabbit_channel->BasicPublish("", "bookings", AmqpClient::BasicMessage::Create(msg));
             response_body = "{\"status\": \"PROCESSING\"}";
         } else {
+            // Updated DAO automatically uses MASTER pool now
             BookingDAO::createBooking(1, 1, {seat_val}, 50.0);
             response_body = "{\"status\": \"CONFIRMED\"}";
         }
@@ -188,11 +195,13 @@ int main(int argc, char* argv[])
     });
 
     // =========================================================
-    // 8. MY BOOKINGS
+    // 8. MY BOOKINGS (READ -> REPLICA POOL)
     // =========================================================
     CROW_ROUTE(app, "/api/my-bookings").methods(crow::HTTPMethod::GET)([](const crow::request& req){
         try {
-            DBConnection conn; pqxx::work txn(*conn);
+            // 🟢 READ ACTION
+            DBConnection conn(PoolType::REPLICA); 
+            pqxx::work txn(*conn);
             pqxx::result res = txn.exec_params("SELECT id, total_amount, status FROM bookings WHERE user_id = 1 ORDER BY id DESC");
             crow::json::wvalue json_arr;
             int i = 0;
