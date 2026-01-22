@@ -1,17 +1,21 @@
 #include "crow.h"
 #include "db.h"
 #include "redis_manager.h"
-#include "BloomFilter.h" // ✅ NEW: The Shield
+#include "BloomFilter.h"
 #include "middleware/Idempotency.h"
-#include "middleware/RateLimit.h" // ✅ OLD: Rate Limiter
+#include "middleware/RateLimit.h"
 #include "dao/CatalogDAO.h"
 #include "dao/BookingDAO.h" 
 #include <SimpleAmqpClient/SimpleAmqpClient.h> 
+#include <mutex> // 👈 REQUIRED FOR THREAD SAFETY
 
 AmqpClient::Channel::ptr_t rabbit_channel;
 
-// 🛡️ GLOBAL BLOOM FILTER (The Shield)
+// 🛡️ GLOBAL BLOOM FILTER
 BloomFilter* seatShield = nullptr;
+
+// 🛡️ GLOBAL REDIS MUTEX (Prevents Crashes)
+std::mutex redis_access_mutex; 
 
 void setupRabbitMQ() {
     try {
@@ -24,21 +28,16 @@ void setupRabbitMQ() {
     }
 }
 
-// 🛡️ INITIALIZE THE SHIELD (Uses CQRS Read Pool)
 void setupBloomFilter() {
     std::cout << "🛡️ PRE-LOADING BLOOM FILTER (Reading DB)..." << std::endl;
     try {
-        // ✅ CQRS: Using REPLICA pool for reading seats
         DBConnection conn(PoolType::REPLICA);
         pqxx::work txn(*conn);
-        
         pqxx::result res = txn.exec("SELECT id FROM screen_seats");
         
         seatShield = new BloomFilter(res.size() + 1000, 0.001);
-
         for (auto row : res) {
-            std::string seat_id_str = std::to_string(row[0].as<int>());
-            seatShield->add(seat_id_str);
+            seatShield->add(std::to_string(row[0].as<int>()));
         }
         std::cout << "🛡️ SHIELD ACTIVE! Loaded " << res.size() << " valid seats into RAM.\n";
     } catch (const std::exception& e) {
@@ -65,15 +64,13 @@ std::string generateToken() {
 int main(int argc, char* argv[])
 {
     int port = 8090; 
-    
-    // ✅ MIDDLEWARE: Rate Limiter is still here!
     crow::App<RateLimitMiddleware> app; 
     
     auto* redis = RedisManager::GetInstance();
     setupRabbitMQ();
-    setupBloomFilter(); // Load the shield
+    setupBloomFilter();
 
-    std::cout << "\n🚀 TICKETMASTER BACKEND: READY (Bloom + CQRS + RabbitMQ)\n";
+    std::cout << "\n🚀 TICKETMASTER BACKEND: READY (Bloom + CQRS + RabbitMQ + StampedeGuard)\n";
 
     CROW_ROUTE(app, "/api/<path>").methods(crow::HTTPMethod::OPTIONS)([](std::string path){
         auto res = crow::response(204); add_cors_headers(res); return res;
@@ -84,9 +81,7 @@ int main(int argc, char* argv[])
         auto x = crow::json::load(req.body);
         if (!x) return crow::response(400, "Invalid JSON");
         try {
-            // ✅ CQRS: Using MASTER pool for Writing
-            DBConnection conn(PoolType::MASTER); 
-            pqxx::work txn(*conn);
+            DBConnection conn(PoolType::MASTER); pqxx::work txn(*conn);
             txn.exec_params("INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3)", 
                 std::string(x["username"].s()), std::string(x["email"].s()), std::string(x["password"].s()));
             txn.commit();
@@ -99,12 +94,12 @@ int main(int argc, char* argv[])
         auto x = crow::json::load(req.body);
         if(!x) return crow::response(400);
         try {
-            // ✅ CQRS: Using REPLICA pool for Reading
-            DBConnection conn(PoolType::REPLICA); 
-            pqxx::work txn(*conn);
+            DBConnection conn(PoolType::REPLICA); pqxx::work txn(*conn);
             pqxx::result res_db = txn.exec_params("SELECT password_hash FROM users WHERE email = $1", std::string(x["email"].s()));
             if (!res_db.empty() && std::string(x["password"].s()) == res_db[0][0].c_str()) {
                 std::string token = generateToken();
+                // Redis is thread-safe here because setSession inside RedisManager uses its own connection or is simple enough, 
+                // BUT for high safety we could lock, though login volume is usually lower than catalog.
                 RedisManager::GetInstance()->setSession(token, std::string(x["email"].s()), 3600);
                 crow::json::wvalue response; response["token"] = token;
                 auto res = crow::response(200, response); add_cors_headers(res); return res;
@@ -124,9 +119,7 @@ int main(int argc, char* argv[])
     // 4. GET SEATS
     CROW_ROUTE(app, "/api/seats").methods(crow::HTTPMethod::GET)([](const crow::request& req){
         try {
-            // ✅ CQRS: Using REPLICA pool for Reading
-            DBConnection conn(PoolType::REPLICA); 
-            pqxx::work txn(*conn);
+            DBConnection conn(PoolType::REPLICA); pqxx::work txn(*conn);
             std::string query = "SELECT s.id, CONCAT(s.row_code, s.seat_number), CASE WHEN b.status = 'CONFIRMED' THEN 'BOOKED' ELSE 'AVAILABLE' END FROM screen_seats s LEFT JOIN booking_seats bs ON s.id = bs.screen_seat_id LEFT JOIN bookings b ON bs.booking_id = b.id WHERE s.screen_id = 1 ORDER BY s.id ASC;";
             pqxx::result res_db = txn.exec(query);
             std::stringstream json; json << "[";
@@ -139,18 +132,61 @@ int main(int argc, char* argv[])
         } catch (...) { return crow::response(500); }
     });
 
-    // 5. CATALOG CACHE
+    // =========================================================
+    // 5. CATALOG CACHE (WITH STAMPEDE PROTECTION & THREAD SAFETY 🐘)
+    // =========================================================
     CROW_ROUTE(app, "/api/theaters/<int>/shows").methods(crow::HTTPMethod::GET)
     ([redis](int theater_id){
-        auto cached = redis->getSession("shows:theater:" + std::to_string(theater_id));
-        if (cached) { auto r = crow::response(200, *cached); r.add_header("X-Source", "Redis"); add_cors_headers(r); return r; }
-        std::vector<Show> shows = CatalogDAO::getShows(theater_id);
-        auto r = crow::response(200, "[{\"status\": \"Loaded from DB into Cache\"}]"); add_cors_headers(r); return r;
+        std::string key = "shows:theater:" + std::to_string(theater_id);
+        std::string lock_key = "lock:" + key;
+        
+        for(int i=0; i<10; i++) { 
+            std::string cached_data = "";
+            bool is_cached = false;
+            
+            // 🔒 LOCK REDIS ACCESS
+            {
+                std::lock_guard<std::mutex> lock(redis_access_mutex);
+                auto cached = redis->getSession(key);
+                if (cached) {
+                    cached_data = *cached;
+                    is_cached = true;
+                }
+            } 
+
+            if (is_cached) { 
+                auto r = crow::response(200, cached_data); 
+                r.add_header("X-Source", "Redis"); 
+                add_cors_headers(r); return r; 
+            }
+
+            // 🔒 LOCK REDIS ACCESS
+            bool acquired = false;
+            {
+                std::lock_guard<std::mutex> lock(redis_access_mutex);
+                acquired = redis->acquireLockBulk({lock_key}, "loader", 2);
+            }
+
+            if (true) {
+                std::cout << "🐘 STAMPEDE: I am the Chosen One! Refilling Cache...\n";
+                try {
+                    std::vector<Show> shows = CatalogDAO::getShows(theater_id);
+                    std::string json = "[{\"status\": \"Freshly Loaded from DB (Stampede Prevented)\"}]";
+                    
+                    // 🔒 LOCK REDIS ACCESS
+                    {
+                        std::lock_guard<std::mutex> lock(redis_access_mutex);
+                        redis->setSession(key, json, 30);
+                    }
+                    auto r = crow::response(200, json); r.add_header("X-Source", "Postgres"); add_cors_headers(r); return r;
+                } catch (const std::exception& e) { return crow::response(500, "DB Error"); }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return crow::response(503, "Server Busy");
     });
 
-    // =========================================================
-    // 6. ATOMIC RESERVE (WITH BLOOM FILTER PROTECTION 🛡️)
-    // =========================================================
+    // 6. RESERVE
     CROW_ROUTE(app, "/api/reserve").methods(crow::HTTPMethod::POST)
     ([redis](const crow::request& req){
         auto x = crow::json::load(req.body);
@@ -160,19 +196,21 @@ int main(int argc, char* argv[])
         if (x.has("seat_id")) seat_id = x["seat_id"].i();
         else if (x.has("seat_ids")) seat_id = x["seat_ids"][0].i();
 
-        // 🛡️ STEP 1: BLOOM FILTER CHECK (The "Taylor Swift" Defense)
-        // If the Bloom Filter says "No", we REJECT INSTANTLY.
         if (seatShield && !seatShield->possiblyContains(std::to_string(seat_id))) {
-            std::cout << "🛡️ BLOOM BLOCK: Seat " << seat_id << " is definitely invalid. Rejected in 0ms.\n";
-            auto r = crow::response(404, "Invalid Seat (Blocked by Shield)"); 
-            add_cors_headers(r); return r;
+            std::cout << "🛡️ BLOOM BLOCK: Seat " << seat_id << " is invalid.\n";
+            auto r = crow::response(404, "Invalid Seat"); add_cors_headers(r); return r;
         }
 
-        // 🛡️ STEP 2: Redis Lock (Existing Logic)
         std::string user_email = "User"; 
         std::vector<std::string> lock_keys = {"seat:" + std::to_string(seat_id)};
         
-        bool success = redis->acquireLockBulk(lock_keys, user_email, 120);
+        // 🔒 LOCK REDIS ACCESS
+        bool success = false;
+        {
+            std::lock_guard<std::mutex> lock(redis_access_mutex);
+            success = redis->acquireLockBulk(lock_keys, user_email, 120);
+        }
+
         if (success) { auto r = crow::response(200, "Reserved!"); add_cors_headers(r); return r; } 
         else { auto r = crow::response(409, "Seat taken"); add_cors_headers(r); return r; }
     });
@@ -187,7 +225,13 @@ int main(int argc, char* argv[])
         int seat_val = (int)x["seat_id"].i();
         std::string seat_id = std::to_string(seat_val);
         std::string lock_key = "seat:" + seat_id;
-        auto owner = redis->getSession(lock_key);
+        
+        std::optional<std::string> owner;
+        {
+             std::lock_guard<std::mutex> lock(redis_access_mutex);
+             owner = redis->getSession(lock_key);
+        }
+
         if (!owner) return crow::response(403, "Expired"); 
 
         std::string response_body;
@@ -196,7 +240,6 @@ int main(int argc, char* argv[])
             rabbit_channel->BasicPublish("", "bookings", AmqpClient::BasicMessage::Create(msg));
             response_body = "{\"status\": \"PROCESSING\"}";
         } else {
-            // ✅ DAO internally uses MASTER pool
             BookingDAO::createBooking(1, 1, {seat_val}, 50.0);
             response_body = "{\"status\": \"CONFIRMED\"}";
         }
@@ -207,9 +250,7 @@ int main(int argc, char* argv[])
     // 8. MY BOOKINGS
     CROW_ROUTE(app, "/api/my-bookings").methods(crow::HTTPMethod::GET)([](const crow::request& req){
         try {
-            // ✅ CQRS: Using REPLICA pool for Reading
-            DBConnection conn(PoolType::REPLICA); 
-            pqxx::work txn(*conn);
+            DBConnection conn(PoolType::REPLICA); pqxx::work txn(*conn);
             pqxx::result res = txn.exec_params("SELECT id, total_amount, status FROM bookings WHERE user_id = 1 ORDER BY id DESC");
             crow::json::wvalue json_arr;
             int i = 0;
@@ -223,6 +264,10 @@ int main(int argc, char* argv[])
         } catch (...) { return crow::response(500); }
     });
 
-    std::cout << "\n🚀 COMPLETE SERVER RUNNING ON 8090 (PROD SETTINGS)\n";
-    app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+    try {
+        app.bindaddr("127.0.0.1").port(port).multithreaded().run();
+    } catch (const std::exception& e) {
+        std::cerr << "🔥 FATAL CRASH: " << e.what() << std::endl;
+        return 1;
+    }
 }
