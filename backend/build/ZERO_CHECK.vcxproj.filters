@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\athar\Downloads\TicketMaster-CPP\backend\build\CMakeFiles\4e8e94cd97ff1fc566efe80cb4efc821\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{13E6A0B6-1A6E-339F-9DC4-16505DB66F21}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

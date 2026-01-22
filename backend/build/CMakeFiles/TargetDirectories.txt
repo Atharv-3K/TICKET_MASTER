@@ -1,0 +1,3 @@
+C:/Users/athar/Downloads/TicketMaster-CPP/backend/build/CMakeFiles/server.dir
+C:/Users/athar/Downloads/TicketMaster-CPP/backend/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/athar/Downloads/TicketMaster-CPP/backend/build/CMakeFiles/ZERO_CHECK.dir
